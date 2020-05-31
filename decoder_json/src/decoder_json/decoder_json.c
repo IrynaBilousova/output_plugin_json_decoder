@@ -16,6 +16,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include "decoder_json_filter.h"
 #include "postgres.h"
 #include "access/genam.h"
 #include "access/sysattr.h"
@@ -32,6 +33,7 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 #include "utils/array.h"
+#include "executor/spi.h"
 #include <assert.h>
 #include <jansson.h>
 
@@ -82,13 +84,16 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
     AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
 
+    bool is_okey = decoder_json_filter_init();
+    Assert(is_okey == true);
+    elog(INFO, "_PG_output_plugin_init \n");
+
     cb->startup_cb = decoder_json_startup;
     cb->begin_cb = decoder_json_begin_txn;
     cb->change_cb = decoder_json_change;
     cb->commit_cb = decoder_json_commit_txn;
     cb->shutdown_cb = decoder_json_shutdown;
 }
-
 
 /* initialize this plugin */
 static void
@@ -98,6 +103,7 @@ decoder_json_startup(LogicalDecodingContext *ctx,
 {
     ListCell   *option;
     DecoderRawData *data;
+    elog(INFO, "decoder_json_startup \n");
 
     json_set_alloc_funcs(palloc,pfree);
     data = palloc(sizeof(DecoderRawData));
@@ -225,7 +231,7 @@ static json_t
 
     deconstruct_array(arr, elmtype, elmlen, elmbyval, 'i', &elems, NULL, &nelems);
     for (i = 0; i < nelems; ++i) {
-        json_array_append_new(result, get_json_value(elems[i], elmtype, false));
+        json_array_append_new(result, get_json_value(elems[i], elmtype, false)); 
     }
 
     pfree(elems);
@@ -319,7 +325,7 @@ static Pair
     char *attname;
     json_t *val;
 
-    attr = tupdesc->attrs[natt - 1];
+    attr = &tupdesc->attrs[natt - 1];
 
     /* Skip dropped columns and system columns */
     if (attr->attisdropped || attr->attnum < 0)
@@ -348,7 +354,7 @@ static json_t
            HeapTuple tuple)
 {
     int natt;
-    json_t *pairs = json_object();
+    json_t *pairs = json_object_public();
 
     for (natt = 0; natt < tupdesc->natts; natt++) {
         Pair *pair = get_pair(tupdesc, tuple, natt + 1);
@@ -371,7 +377,7 @@ static json_t
 {
     TupleDesc tupdesc = RelationGetDescr(relation);
     int natt;
-    json_t *allClauses = json_object();
+    json_t *allClauses = json_object_public();
 
     Assert(relation->rd_rel->relreplident == REPLICA_IDENTITY_DEFAULT ||
            relation->rd_rel->relreplident == REPLICA_IDENTITY_FULL ||
@@ -432,12 +438,13 @@ write_struct(StringInfo s,
              Relation relation,
              json_t *clause,
              json_t *data,
+             json_t *subsribers,
              bool sort_keys)
 {
     char *relname = get_relname(relation);
     char *result;
     size_t flags = JSON_COMPACT;
-    json_t *action = json_object();
+    json_t *action = json_object_public();
 
     if (sort_keys) flags |= JSON_SORT_KEYS;
 
@@ -448,6 +455,8 @@ write_struct(StringInfo s,
         json_object_set(action, "c", clause);
     if (data != NULL)
         json_object_set(action, "d", data);
+    if (data != NULL)
+        json_object_set(action, "subsribers", subsribers);
 
     result = json_dumps(action, flags);
     json_decref(action);
@@ -465,11 +474,12 @@ static void
 decoder_json_insert(StringInfo s,
                    Relation relation,
                    HeapTuple tuple,
-                   bool sort_keys)
+                   bool sort_keys,
+                   json_t *subsribers)
 {
     TupleDesc tupdesc = RelationGetDescr(relation);
     json_t *data = get_pairs(tupdesc, tuple);
-    write_struct(s, 0, relation, NULL, data, sort_keys);
+    write_struct(s, 0, relation, NULL, data, subsribers, sort_keys);
     json_decref(data);
 }
 
@@ -482,7 +492,8 @@ static void
 decoder_json_delete(StringInfo s,
                     Relation relation,
                     HeapTuple tuple,
-                    bool sort_keys)
+                    bool sort_keys,
+                    json_t *subsribers)
 {
     /*
      * Here the same tuple is used as old and new values, selectivity will
@@ -490,7 +501,7 @@ decoder_json_delete(StringInfo s,
      * IDENTITY.
      */
     json_t *clause = get_where_clause(relation, tuple, tuple);
-    write_struct(s, 2, relation, clause, NULL, sort_keys);
+    write_struct(s, 2, relation, clause, NULL, subsribers, sort_keys);
     json_decref(clause);
 }
 
@@ -503,7 +514,8 @@ decoder_json_update(StringInfo s,
                    Relation relation,
                    HeapTuple oldtuple,
                    HeapTuple newtuple,
-                   bool sort_keys)
+                   bool sort_keys,
+                   json_t *subsribers)
 {
     json_t *clause;
     json_t *data;
@@ -515,9 +527,31 @@ decoder_json_update(StringInfo s,
 
     clause = get_where_clause(relation, oldtuple, newtuple);
     data = get_pairs(tupdesc, newtuple);
-    write_struct(s, 1, relation, clause, data, sort_keys);
+    write_struct(s, 1, relation, clause, data, subsribers, sort_keys);
     json_decref(clause);
     json_decref(data);
+}
+
+static void decoder_json_skip(StringInfo s)
+{
+    json_t *skip = json_object_public();
+    json_object_set_new(skip, "skip", json_integer(1));
+    char* result = json_dumps(skip, JSON_COMPACT);
+    json_decref(skip);
+
+    appendStringInfoString(s, result);
+    pfree(result);
+}
+
+static json_t * decoder_json_append_db_subscribers(const int* indexes, int count)
+{
+    json_t *subsribers = json_array();
+
+    for (int i = 0; i < count; ++i) {
+        json_array_append_new(subsribers, json_integer(indexes[i]));
+    }
+
+    return subsribers;
 }
 
 /*
@@ -533,6 +567,23 @@ decoder_json_change(LogicalDecodingContext *ctx,
     MemoryContext   old;
     char            replident = relation->rd_rel->relreplident;
     bool            is_rel_non_selective;
+
+    elog(INFO, "decoder_json_change \n");
+
+    char *relname = get_relname(relation);
+
+    int indexes[DB_INDEXES_SIZE] = {0};
+    int count = 0;
+
+    if(!decoder_json_filter_get_db_for_publication_table(relname, &indexes, DB_INDEXES_SIZE, &count))
+    {
+        OutputPluginPrepareWrite(ctx, true);
+        decoder_json_skip(ctx->out);
+        OutputPluginWrite(ctx, true);
+        return;
+    }
+
+    json_t *subsribers = decoder_json_append_db_subscribers(indexes, count);
 
     data = ctx->output_plugin_private;
 
@@ -558,9 +609,10 @@ decoder_json_change(LogicalDecodingContext *ctx,
             {
                 OutputPluginPrepareWrite(ctx, true);
                 decoder_json_insert(ctx->out,
-                                   relation,
-                                   &change->data.tp.newtuple->tuple,
-                                   data->sort_keys);
+                           relation,
+                           &change->data.tp.newtuple->tuple,
+                           data->sort_keys,
+                           subsribers);
                 OutputPluginWrite(ctx, true);
             }
             break;
@@ -577,7 +629,8 @@ decoder_json_change(LogicalDecodingContext *ctx,
                                    relation,
                                    oldtuple,
                                    newtuple,
-                                   data->sort_keys);
+                                   data->sort_keys,
+                                   subsribers);
                 OutputPluginWrite(ctx, true);
             }
             break;
@@ -588,7 +641,8 @@ decoder_json_change(LogicalDecodingContext *ctx,
                 decoder_json_delete(ctx->out,
                                    relation,
                                    &change->data.tp.oldtuple->tuple,
-                                   data->sort_keys);
+                                   data->sort_keys,
+                                   subsribers);
                 OutputPluginWrite(ctx, true);
             }
             break;
