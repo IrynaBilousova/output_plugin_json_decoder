@@ -33,9 +33,11 @@ static bool decoder_json_filter_find_pg_publication(
 
     char query[300];
 
-    char schema_name[20];
+    char schema_name[NAMEDATALEN - 1];
     char* table_name = strstr(real_name, ".");
+    elog(INFO, "decoder_json_filter_find_pg_publication: table_name [%s]", table_name);
     strncpy(schema_name, real_name, strlen(real_name) - strlen(table_name));
+    elog(INFO, "decoder_json_filter_find_pg_publication: table_name [%s]", table_name);
     table_name++;
 
     sprintf(query, "select si.subscriber_id from psql_to_mongo_replication.subscription_info as si join pg_publication_tables as ppt on ppt.pubname = si.pubname where ppt.tablename = '%s' and ppt.schemaname = '%s';", table_name, schema_name);
@@ -45,9 +47,11 @@ static bool decoder_json_filter_find_pg_publication(
 
     if(ret < 0)
     {
-        elog(ERROR, "decoder_json_filter_find_pg_publication: SPI_exec...error %s", SPI_result_code_string(ret));
+        elog(INFO, "decoder_json_filter_find_pg_publication: SPI_exec...error %s", SPI_result_code_string(ret));
         return false;
     }
+
+    elog(INFO, "decoder_json_filter_find_pg_publication: db_instances_size %d", db_instances_size);
 
     if(db_instances_size < SPI_processed) return false;
 
@@ -60,8 +64,8 @@ static bool decoder_json_filter_find_pg_publication(
 
     for (int j = 0; j < proc; j++)
     {
+        elog(INFO, "SPI_processed check data\n");
         HeapTuple tuple = tuptable->vals[j];
-
         // for (i = 1, buf[0] = 0; i <= tupdesc->natts; i++)
         //     SPI_getvalue(tuple, tupdesc, i),
         //             (i == tupdesc->natts) ? " " : " |");
@@ -90,27 +94,27 @@ static bool decoder_json_filter_init_validate_schema_spi_unsave()
     int ret = SPI_execute("SELECT to_regclass('psql_to_mongo_replication');", true, 0);
     if (ret < 0)
     {
-        elog(ERROR, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
+        elog(INFO, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
 	    return false;
     }
 
     ret = SPI_execute("SELECT to_regclass('psql_to_mongo_replication.subscribers');", true, 0);
     if (ret < 0)
     {
-        elog(ERROR, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
+        elog(INFO, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
 	    return false;
     }
 
     ret = SPI_execute("SELECT to_regclass('psql_to_mongo_replication.subscription_info');", true, 0);
     if (ret < 0)
     {
-        elog(ERROR, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
+        elog(INFO, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
 	    return false;
     }
 
     if (SPI_tuptable == NULL)
     {
-        elog(ERROR, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
+        elog(INFO, "_PG_init: SPI_execute returned %s", SPI_result_code_string(ret));
         return false;
     }
 
@@ -142,7 +146,10 @@ bool decoder_json_filter_get_db_for_publication_table(
     elog(INFO, "decoder_json_filter_get_db_for_publication_table %s\n", table_name);
     bool okey = decoder_json_filter_find_pg_publication(table_name, db_instances, db_instances_size, db_find_count);
 
+    elog(INFO, "decoder_json_filter_get_db_for_publication_table finishing SPI\n");
+
     SPI_finish();
 
+    elog(INFO, "decoder_json_filter_get_db_for_publication_table SPI SUCCESS finished\n");
     return okey;
 }

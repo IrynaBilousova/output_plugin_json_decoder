@@ -84,8 +84,8 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 {
     AssertVariableIsOfType(&_PG_output_plugin_init, LogicalOutputPluginInit);
 
-    bool is_okey = decoder_json_filter_init();
-    Assert(is_okey == true);
+    //bool is_okey = decoder_json_filter_init();
+    //Assert(is_okey == true);
     elog(INFO, "_PG_output_plugin_init \n");
 
     cb->startup_cb = decoder_json_startup;
@@ -455,7 +455,7 @@ write_struct(StringInfo s,
         json_object_set(action, "c", clause);
     if (data != NULL)
         json_object_set(action, "d", data);
-    if (data != NULL)
+    if (data != NULL && subsribers != NULL)
         json_object_set(action, "subsribers", subsribers);
 
     result = json_dumps(action, flags);
@@ -538,6 +538,7 @@ static void decoder_json_skip(StringInfo s)
     json_object_set_new(skip, "skip", json_integer(1));
     char* result = json_dumps(skip, JSON_COMPACT);
     json_decref(skip);
+    elog(INFO, "decoder_json_skip: %s\n", result);
 
     appendStringInfoString(s, result);
     pfree(result);
@@ -554,54 +555,25 @@ static json_t * decoder_json_append_db_subscribers(const int* indexes, int count
     return subsribers;
 }
 
-/*
- * Callback for individual changed tuples
- */
-static void
-decoder_json_change(LogicalDecodingContext *ctx,
-                    ReorderBufferTXN *txn,
-                    Relation relation,
-                    ReorderBufferChange *change)
+static void decoder_json_decode_action(
+      LogicalDecodingContext *ctx
+    , ReorderBufferChange *change
+    , Relation relation
+    , DecoderRawData *data
+    , json_t *subsribers)
 {
-    DecoderRawData *data;
-    MemoryContext   old;
-    char            replident = relation->rd_rel->relreplident;
-    bool            is_rel_non_selective;
-
-    elog(INFO, "decoder_json_change \n");
-
-    char *relname = get_relname(relation);
-
-    int indexes[DB_INDEXES_SIZE] = {0};
-    int count = 0;
-
-    if(!decoder_json_filter_get_db_for_publication_table(relname, &indexes, DB_INDEXES_SIZE, &count))
-    {
-        OutputPluginPrepareWrite(ctx, true);
-        decoder_json_skip(ctx->out);
-        OutputPluginWrite(ctx, true);
-        return;
-    }
-
-    json_t *subsribers = decoder_json_append_db_subscribers(indexes, count);
-
-    data = ctx->output_plugin_private;
-
-    /* Avoid leaking memory by using and resetting our own context */
-    old = MemoryContextSwitchTo(data->context);
-
-    /*
+    char replident = relation->rd_rel->relreplident;
+     /*
      * Determine if relation is selective enough for WHERE clause generation
      * in UPDATE and DELETE cases. A non-selective relation uses REPLICA
      * IDENTITY set as NOTHING, or DEFAULT without an available replica
      * identity index.
      */
     RelationGetIndexList(relation);
-    is_rel_non_selective = (replident == REPLICA_IDENTITY_NOTHING ||
+    bool is_rel_non_selective = (replident == REPLICA_IDENTITY_NOTHING ||
                             (replident == REPLICA_IDENTITY_DEFAULT &&
                              !OidIsValid(relation->rd_replidindex)));
 
-    /* Decode entry depending on its type */
     switch (change->action)
     {
         case REORDER_BUFFER_CHANGE_INSERT:
@@ -651,6 +623,53 @@ decoder_json_change(LogicalDecodingContext *ctx,
             Assert(0);
             break;
     }
+}
+
+static void decoder_json_decode_entry_depending(
+      LogicalDecodingContext *ctx
+    , ReorderBufferChange *change
+    , Relation relation
+    , DecoderRawData *data)
+{
+    int indexes[DB_INDEXES_SIZE] = {0};
+    int count = 0;
+
+    char *relname = get_relname(relation);
+
+    if(!decoder_json_filter_get_db_for_publication_table(relname, &indexes, DB_INDEXES_SIZE, &count))
+    {
+        OutputPluginPrepareWrite(ctx, true);
+        decoder_json_skip(ctx->out);
+        OutputPluginWrite(ctx, true);
+        return;
+    }
+
+    json_t *subsribers = decoder_json_append_db_subscribers(indexes, count);
+
+    decoder_json_decode_action(ctx, change, relation, data, subsribers);
+}
+
+/*
+ * Callback for individual changed tuples
+ */
+static void
+decoder_json_change(LogicalDecodingContext *ctx,
+                    ReorderBufferTXN *txn,
+                    Relation relation,
+                    ReorderBufferChange *change)
+{
+    DecoderRawData *data;
+    MemoryContext   old;
+
+    elog(INFO, "decoder_json_change \n");
+
+    data = ctx->output_plugin_private;
+
+    /* Avoid leaking memory by using and resetting our own context */
+    old = MemoryContextSwitchTo(data->context);
+
+    /* Decode entry depending on its type */
+    decoder_json_decode_entry_depending(ctx, change, relation, data);
 
     MemoryContextSwitchTo(old);
     MemoryContextReset(data->context);
