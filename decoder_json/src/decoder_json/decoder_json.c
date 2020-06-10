@@ -455,7 +455,7 @@ write_struct(StringInfo s,
         json_object_set(action, "c", clause);
     if (data != NULL)
         json_object_set(action, "d", data);
-    if (data != NULL && subsribers != NULL)
+    if (subsribers != NULL)
         json_object_set(action, "subsribers", subsribers);
 
     result = json_dumps(action, flags);
